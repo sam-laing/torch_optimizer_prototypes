@@ -9,14 +9,6 @@ import math
 from .types import Betas2, OptFloat, OptLossClosure, Params, State
 ParamGroup = Dict[str, Any]
 
-import torch
-from torch.optim.optimizer import Optimizer
-
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
-from torch import Tensor
-import math
-
-ParamGroup = Dict[str, Any]
 
 class NestedMA(Optimizer):
     r"""Implements NestedMA Optimizer Algorithm.
@@ -33,6 +25,7 @@ class NestedMA(Optimizer):
         weight_decay: float = 0.0,
         weight_decouple: bool = True,
         lp: float = 2.0,
+        do_bias_correction: bool = True
     ):
         if lr <= 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -52,8 +45,9 @@ class NestedMA(Optimizer):
         super().__init__(params, defaults)
         self._weight_decouple = weight_decouple
         self.lp = lp
+        self.do_bias_correction = do_bias_correction    
     
-    
+    # not needed
     def _get_options(
         self, param_group: ParamGroup, param_shape: Tuple[int, ...]
     ) -> Tuple[bool, bool]:
@@ -63,9 +57,8 @@ class NestedMA(Optimizer):
     
     def _get_lr(self, param_group: ParamGroup, param_state: State) -> float:
         return param_group["lr"]
-
-    
-
+        
+    # not actually needed
     def _rms(self, tensor: torch.Tensor) -> float:
         return tensor.norm(2) / (tensor.numel() ** 0.5)
     
@@ -82,14 +75,30 @@ class NestedMA(Optimizer):
                 grad = p.grad.data
                 if grad.is_sparse:
                     raise RuntimeError("NestedMA doesn't support sparse gradients")
+                
+
+                if group["weight_decay"] != 0:
+                    #p.data = p.data + group["weight_decay"] * torch.norm(p.data, p=self.lp)
+                    # decoupled weight decay as in AdamW but good ol' Lp norm easily possible too
+                    p.data.mul_(1 - group["lr"] * group["weight_decay"])
+
                 state = self.state[p]
 
                 # State initialization
                 if len(state) == 0:
+
                     state["step"] = 0
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["nested_exp_ma"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                
+                    if self.do_bias_correction:
+                        state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    else:
+                        # set equal to the gradient wrt to just the parameters p
+                        # TOIMPLEMENT
+                        pass
+
+
+
+                    
                 exp_avg_sq = state["exp_avg_sq"]
                 nested_exp_ma = state["nested_exp_ma"]
 
@@ -101,29 +110,20 @@ class NestedMA(Optimizer):
 
                 # Compute bias-corrected second moment
                 bias_correction2 = 1 - beta2 ** state["step"]
-                corrected_exp_avg_sq = exp_avg_sq.div(1 - bias_correction2)
+                corrected_exp_avg_sq = exp_avg_sq.div(bias_correction2)
 
                 # Update nested moving average
                 nested_exp_ma.mul_(beta1).addcdiv_(grad, corrected_exp_avg_sq.sqrt().add_(group["eps"]), value=1 - beta1)
 
                 # Compute bias-corrected first moment
                 bias_correction1 = 1 - beta1 ** state["step"]
-                corrected_nested_ma = nested_exp_ma   #.div(1 - bias_correction1)
-
-                # Apply weight decay if specified
-                if group["weight_decay"] != 0:
-                    #p.data = p.data + group["weight_decay"] * torch.norm(p.data, p=self.lp)
-                    """
-                    # decoupled weight decay as in AdamW but good ol' Lp norm easily possible too 
-                    if self._weight_decouple:
-                        p.data.add_(group["weight_decay"] * torch.norm(p.data, p=self.lp))
-                    else:
-                        p.data.add_(group["weight_decay"] * group["lr"] * torch.norm(p.data, p=self.lp))
-                    """
-                    pass
+                corrected_nested_ma = nested_exp_ma.div(bias_correction1)
+                   
 
                 # Update parameters
-                step_size = group["lr"] * corrected_nested_ma
+                step_size = group["lr"] * corrected_nested_ma 
+            
                 p.data.add_(-step_size)
 
         return loss
+    
